@@ -181,6 +181,7 @@
     <input id="searchInput" type="text" placeholder="Search a place to pin..." autocomplete="off">
     <div class="results" id="results"></div>
   </div>
+  <button class="icon-btn" id="syncBtn" title="Sync across devices">☁</button>
   <button class="icon-btn" id="listBtn" title="My places">☰</button>
 </div>
 
@@ -231,6 +232,51 @@
   </div>
 </div>
 
+<!-- Sync modal -->
+<div class="overlay" id="syncOverlay">
+  <div class="form">
+    <h2>Sync across devices</h2>
+    <div class="sub">Keep your map in sync on your phone, laptop, anywhere, using a private GitHub Gist.</div>
+
+    <div id="syncStatus" style="font-size:13.5px;padding:10px 13px;border-radius:11px;background:var(--teal-soft);color:var(--teal);margin-bottom:16px;font-weight:600;"></div>
+
+    <div id="syncSetup">
+      <div style="font-size:13px;color:var(--ink-soft);line-height:1.6;margin-bottom:14px;">
+        <b>First time?</b> Make a free GitHub token (it only needs the <b>gist</b> permission):
+        <a href="https://github.com/settings/tokens/new?scopes=gist&description=Memory%20Map" target="_blank" style="color:var(--gold-deep);font-weight:600;">create token →</a>
+        Copy it, paste below, and leave the Gist ID blank. On your <b>other</b> devices, paste the same token <i>and</i> the Gist ID this shows you.
+      </div>
+
+      <label class="fld">GitHub token</label>
+      <input type="text" id="syncToken" placeholder="ghp_..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+
+      <label class="fld">Gist ID <span style="font-weight:400;color:var(--ink-faint)">(blank on your first device)</span></label>
+      <input type="text" id="syncGist" placeholder="leave blank to create a new one" autocomplete="off">
+
+      <div class="form-actions">
+        <button class="btn btn-primary" id="syncConnect">Connect</button>
+      </div>
+    </div>
+
+    <div id="syncConnected" style="display:none;">
+      <label class="fld">Your Gist ID <span style="font-weight:400;color:var(--ink-faint)">(use this on your other devices)</span></label>
+      <div style="display:flex;gap:8px;margin-bottom:14px;">
+        <input type="text" id="syncGistShow" readonly style="flex:1;margin:0;">
+        <button class="btn-ghost" id="syncCopy" style="padding:11px 14px;">Copy</button>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary" id="syncNow">Sync now</button>
+      </div>
+      <button class="btn-danger" id="syncDisconnect">Disconnect this device</button>
+    </div>
+
+    <div style="font-size:11.5px;color:var(--ink-faint);line-height:1.5;margin-top:14px;">
+      Your token is stored only on this device and acts like a password for your Gists, keep it private and don't use this on a shared computer. A token limited to the <b>gist</b> permission can only touch your Gists, nothing else.
+    </div>
+    <button class="btn-danger" id="syncCloseBtn" style="color:var(--ink-soft);">Close</button>
+  </div>
+</div>
+
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <script>
 (function () {
@@ -239,15 +285,18 @@
 
   // ---------- storage ----------
   function load() {
-    try { return JSON.parse(localStorage.getItem(KEY)) || { memories: [] }; }
-    catch (e) { return { memories: [] }; }
+    var s;
+    try { s = JSON.parse(localStorage.getItem(KEY)); } catch (e) { s = null; }
+    if (!s) s = { memories: [] };
+    if (!s.deleted) s.deleted = [];
+    return s;
   }
   function persist() {
     try { localStorage.setItem(KEY, JSON.stringify(state)); return true; }
     catch (e) { return false; }
   }
   var state = load();
-  var idSeq = state.memories.reduce(function (m, x) { return Math.max(m, x.id || 0); }, 0);
+  function uid() { return Date.now() * 1000 + Math.floor(Math.random() * 1000); }
 
   // ---------- map ----------
   var map = L.map("map", { zoomControl: true, attributionControl: true, worldCopyJump: true })
@@ -414,21 +463,23 @@
 
     if (editing) {
       editing.title = title; editing.date = date; editing.note = note;
-      editing.type = curType; editing.photo = curPhoto;
+      editing.type = curType; editing.photo = curPhoto; editing.updated = Date.now();
       saveState(editing);
       refreshMarker(editing);
     } else {
+      var now = Date.now();
       var m = {
-        id: ++idSeq, lat: pending.lat, lng: pending.lng, title: title,
+        id: uid(), lat: pending.lat, lng: pending.lng, title: title,
         date: date, note: note, type: curType, photo: curPhoto,
-        country: pending.country || "", created: Date.now()
+        country: pending.country || "", created: now, updated: now
       };
       state.memories.push(m);
-      if (!saveState(m)) { state.memories.pop(); idSeq--; return; }
+      if (!saveState(m)) { state.memories.pop(); return; }
       addMarker(m);
     }
     renderStats();
     closeForm();
+    scheduleSync();
   };
 
   function saveState(m) {
@@ -526,8 +577,10 @@
   };
   function doRemove(id) {
     state.memories = state.memories.filter(function (x) { return x.id !== id; });
+    state.deleted.push({ id: id, updated: Date.now() });
     if (markers[id]) { map.removeLayer(markers[id]); delete markers[id]; }
     persist(); renderStats(); renderList();
+    scheduleSync();
   }
 
   // ---------- hint auto-hide ----------
@@ -539,6 +592,174 @@
     var g = L.featureGroup(Object.keys(markers).map(function (k) { return markers[k]; }));
     try { map.fitBounds(g.getBounds().pad(0.3)); } catch (e) {}
   }
+
+  // ---------- cross-device sync (GitHub Gist) ----------
+  function rerender() {
+    Object.keys(markers).forEach(function (k) { map.removeLayer(markers[k]); });
+    markers = {};
+    state.memories.forEach(addMarker);
+    renderStats();
+    if (panel.classList.contains("open")) renderList();
+  }
+
+  function mergeRemote(remote) {
+    remote = remote || {};
+    var byId = {};
+    state.memories.forEach(function (m) { byId[m.id] = m; });
+    (remote.memories || []).forEach(function (m) {
+      if (!byId[m.id] || (m.updated || 0) > (byId[m.id].updated || 0)) byId[m.id] = m;
+    });
+    var tomb = {};
+    (state.deleted || []).forEach(function (t) { tomb[t.id] = t.updated || 0; });
+    (remote.deleted || []).forEach(function (t) { if (!tomb[t.id] || (t.updated || 0) > tomb[t.id]) tomb[t.id] = t.updated || 0; });
+    var mems = [];
+    Object.keys(byId).forEach(function (id) {
+      var m = byId[id], td = tomb[id];
+      if (td !== undefined && td >= (m.updated || 0)) return; // tombstoned
+      mems.push(m);
+    });
+    state.memories = mems;
+    state.deleted = Object.keys(tomb).map(function (id) { return { id: isNaN(+id) ? id : +id, updated: tomb[id] }; });
+    persist();
+  }
+
+  var syncTimer = null;
+  function scheduleSync() {
+    if (!Sync.connected()) return;
+    clearTimeout(syncTimer);
+    setStatus("Saving changes...");
+    syncTimer = setTimeout(function () { Sync.push(); }, 1500);
+  }
+
+  function setStatus(msg) {
+    var el = document.getElementById("syncStatus");
+    if (el) el.textContent = msg;
+  }
+
+  var Sync = (function () {
+    var SK = "memoryMap.sync";
+    var cfg;
+    try { cfg = JSON.parse(localStorage.getItem(SK)) || {}; } catch (e) { cfg = {}; }
+    function saveCfg() { localStorage.setItem(SK, JSON.stringify(cfg)); }
+    function connected() { return !!(cfg.token && cfg.gistId); }
+    function headers() { return { "Authorization": "Bearer " + cfg.token, "Accept": "application/vnd.github+json" }; }
+    var FILE = "memory-map.json";
+
+    function readGist() {
+      return fetch("https://api.github.com/gists/" + cfg.gistId, { headers: headers() })
+        .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+        .then(function (g) {
+          var f = g.files && g.files[FILE];
+          if (!f) return {};
+          if (f.truncated && f.raw_url) {
+            return fetch(f.raw_url, { headers: headers() }).then(function (r) { return r.json(); });
+          }
+          return JSON.parse(f.content || "{}");
+        });
+    }
+
+    function writeGist() {
+      var body = { files: {} };
+      body.files[FILE] = { content: JSON.stringify(state) };
+      return fetch("https://api.github.com/gists/" + cfg.gistId, {
+        method: "PATCH", headers: headers(), body: JSON.stringify(body)
+      }).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); });
+    }
+
+    function createGist() {
+      var body = { description: "Memory Map data (do not delete)", public: false, files: {} };
+      body.files[FILE] = { content: JSON.stringify(state) };
+      return fetch("https://api.github.com/gists", {
+        method: "POST", headers: headers(), body: JSON.stringify(body)
+      }).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); });
+    }
+
+    function stamp() {
+      cfg.lastSync = Date.now();
+      saveCfg();
+      var d = new Date();
+      setStatus("Synced at " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"));
+    }
+
+    return {
+      connected: connected,
+      gistId: function () { return cfg.gistId; },
+      // push local -> remote (pull+merge first to avoid clobbering other devices)
+      push: function () {
+        if (!connected()) return Promise.resolve();
+        return readGist().then(mergeRemote).then(writeGist).then(function () { rerender(); stamp(); })
+          .catch(function (e) { setStatus("Sync error: " + e.message); });
+      },
+      pull: function () {
+        if (!connected()) return Promise.resolve();
+        setStatus("Syncing...");
+        return readGist().then(function (remote) { mergeRemote(remote); rerender(); stamp(); })
+          .catch(function (e) { setStatus("Sync error: " + e.message); });
+      },
+      connect: function (token, gistId) {
+        cfg.token = token.trim();
+        if (gistId && gistId.trim()) {
+          cfg.gistId = gistId.trim(); saveCfg();
+          setStatus("Connecting...");
+          return readGist().then(function (remote) { mergeRemote(remote); rerender(); return writeGist(); })
+            .then(function () { stamp(); return true; });
+        }
+        saveCfg();
+        setStatus("Creating your private gist...");
+        return createGist().then(function (g) { cfg.gistId = g.id; saveCfg(); stamp(); return true; });
+      },
+      disconnect: function () { cfg = {}; localStorage.removeItem(SK); }
+    };
+  })();
+
+  // sync UI
+  var syncOverlay = document.getElementById("syncOverlay");
+  function paintSync() {
+    var on = Sync.connected();
+    document.getElementById("syncSetup").style.display = on ? "none" : "block";
+    document.getElementById("syncConnected").style.display = on ? "block" : "none";
+    if (on) {
+      document.getElementById("syncGistShow").value = Sync.gistId();
+      setStatus("Connected. Syncing...");
+    } else {
+      setStatus("Not connected, your map lives only on this device.");
+    }
+  }
+  document.getElementById("syncBtn").onclick = function () {
+    paintSync();
+    syncOverlay.classList.add("show");
+    if (Sync.connected()) Sync.pull();
+  };
+  document.getElementById("syncCloseBtn").onclick = function () { syncOverlay.classList.remove("show"); };
+  syncOverlay.onclick = function (e) { if (e.target === syncOverlay) syncOverlay.classList.remove("show"); };
+
+  document.getElementById("syncConnect").onclick = function () {
+    var token = document.getElementById("syncToken").value;
+    var gistId = document.getElementById("syncGist").value;
+    if (!token.trim()) { setStatus("Paste your GitHub token first."); return; }
+    document.getElementById("syncConnect").disabled = true;
+    Sync.connect(token, gistId).then(function () {
+      paintSync();
+    }).catch(function (e) {
+      setStatus("Couldn't connect: " + e.message + ". Check the token and Gist ID.");
+    }).then(function () { document.getElementById("syncConnect").disabled = false; });
+  };
+  document.getElementById("syncNow").onclick = function () { Sync.push(); };
+  document.getElementById("syncCopy").onclick = function () {
+    var inp = document.getElementById("syncGistShow");
+    inp.select(); try { document.execCommand("copy"); } catch (e) {}
+    if (navigator.clipboard) navigator.clipboard.writeText(inp.value);
+    document.getElementById("syncCopy").textContent = "Copied";
+    setTimeout(function () { document.getElementById("syncCopy").textContent = "Copy"; }, 1500);
+  };
+  document.getElementById("syncDisconnect").onclick = function () {
+    if (confirm("Disconnect sync on this device? Your pins stay here, but they'll stop syncing.")) {
+      Sync.disconnect(); paintSync();
+    }
+  };
+
+  // pull on load if already connected
+  if (Sync.connected()) Sync.pull();
 })();
 </script>
 </body>
